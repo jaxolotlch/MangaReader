@@ -30,7 +30,15 @@ import coil3.request.ImageRequest
 import kotlin.random.Random
 
 @Composable
-fun PageImage(page: Page, contentDescription: String, modifier: Modifier = Modifier, paper: Boolean = false, onLoaded: () -> Unit = {}, debugContext: String = contentDescription) {
+fun PageImage(
+    page: Page,
+    contentDescription: String,
+    modifier: Modifier = Modifier,
+    paper: Boolean = false,
+    onLoaded: () -> Unit = {},
+    debugContext: String = contentDescription,
+    onPermanentFailure: (Page.Remote, ImageFailure) -> Unit = { _, _ -> }
+) {
     when (page) {
         is Page.Local -> {
             androidx.compose.runtime.LaunchedEffect(page) { onLoaded() }
@@ -39,11 +47,12 @@ fun PageImage(page: Page, contentDescription: String, modifier: Modifier = Modif
         is Page.Remote -> {
             val context = LocalContext.current
             val request = remember(context, page.url) {
+                ImagePipeline.register(page)
                 // Unsupported schemes become a normal loading error, never a file/content fetch.
                 val uri = android.net.Uri.parse(page.url)
                 val valid = uri.scheme in listOf("http", "https") && !uri.host.isNullOrBlank()
                 ImageRequest.Builder(context)
-                    .data(if (valid) DownloadedImages.existing(context, page.url) ?: page.url else null)
+                    .data(if (valid) DownloadedImages.requestData(page) { DownloadedImages.existing(context, it) } else null)
                     .diskCacheKey(page.url)
                     .diskCachePolicy(CachePolicy.ENABLED)
                     .memoryCachePolicy(CachePolicy.ENABLED)
@@ -62,7 +71,10 @@ fun PageImage(page: Page, contentDescription: String, modifier: Modifier = Modif
                 error = {
                     val failedPainter = painter
                     val failure = remember(it.result.throwable) { ImageDiagnostics.classify(it.result.throwable) }
-                    LaunchedEffect(it.result) { ImageDiagnostics.report(it.result.throwable, debugContext) }
+                    LaunchedEffect(it.result) {
+                        ImageDiagnostics.report(it.result.throwable, debugContext)
+                        if (failure.permanent) onPermanentFailure(page, failure)
+                    }
                     val scope = rememberCoroutineScope()
                     var retrying by remember { mutableStateOf(false) }
                     Column(Modifier.fillMaxSize().padding(8.dp),

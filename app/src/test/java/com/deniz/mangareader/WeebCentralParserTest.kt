@@ -20,6 +20,9 @@ class WeebCentralParserTest {
     }
     @Test fun pageOrderAndOriginalUrlsRemainUnchanged() {
         val pages = source.parsePages(html("""<img src="/logo.svg" alt="Logo"><img src="https://cdn.example/01.jpg" alt="Page 1"><img src="https://cdn.example/02.jpg" alt="Page 2">"""))
-        assertEquals(listOf(Page.Remote("https://cdn.example/01.jpg"), Page.Remote("https://cdn.example/02.jpg")), pages)
+        assertEquals(listOf(
+            Page.Remote("https://cdn.example/01.jpg", "weebcentral"),
+            Page.Remote("https://cdn.example/02.jpg", "weebcentral")
+        ), pages)
     }
 }

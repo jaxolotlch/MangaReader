@@ -13,7 +13,7 @@ import androidx.compose.ui.unit.dp
 
 @Composable
 fun LibraryScreen(store: LibraryStore) {
-    val sources = remember { mapOf<String, MangaSource>("atsu" to AtsuSource(), "weebcentral" to WeebCentralSource()) }
+    val sources = remember { SourceCatalog.configured() }
     var openedSource by rememberSaveable { mutableStateOf<String?>(null) }
     var openedBook by rememberSaveable { mutableStateOf<String?>(null) }
     val source = sources[openedSource]

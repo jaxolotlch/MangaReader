@@ -23,9 +23,21 @@ internal fun storageHash(value: String): String = MessageDigest.getInstance("SHA
 object DownloadedImages {
     fun file(context: Context, url: String): File = File(context.filesDir, "downloads/images/${storageHash(url)}.img")
     fun existing(context: Context, url: String): File? = file(context, url).takeIf { it.isFile && it.length() > 0 }
+    internal fun requestData(page: Page.Remote, localFile: (String) -> File?): Any =
+        localFile(page.url) ?: page.url
 }
 
-data class DownloadState(val label: String, val complete: Boolean = false, val active: Boolean = false)
+sealed interface DownloadState {
+    data object NotDownloaded : DownloadState
+    data class Downloading(val completed: Int, val total: Int) : DownloadState
+    data class Downloaded(val total: Int) : DownloadState
+    data class Failed(val completed: Int, val total: Int, val reason: String) : DownloadState
+    data object Deleting : DownloadState
+}
+
+internal fun restoredDownloadState(completed: Int, total: Int): DownloadState =
+    if (total > 0 && completed == total) DownloadState.Downloaded(total)
+    else DownloadState.Failed(completed, total, "Yarım kaldı")
 
 // One foreground-process worker. Completed files and manifests survive process death; retry skips finished files.
 class ChapterDownloads private constructor(private val context: Context) {
@@ -44,7 +56,7 @@ class ChapterDownloads private constructor(private val context: Context) {
                     val json = JSONObject(AtomicFile(file).openRead().bufferedReader().use { it.readText() })
                     val urls = urls(json)
                     val count = urls.count { DownloadedImages.existing(context, it) != null }
-                    update(json.getString("key"), DownloadState(if (urls.isNotEmpty() && count == urls.size) "İndirildi" else "Yarım kaldı · $count/${urls.size} · Tekrar dene", urls.isNotEmpty() && count == urls.size))
+                    update(json.getString("key"), restoredDownloadState(count, urls.size))
                 } catch (_: Exception) { /* An unreadable manifest is never treated as a complete download. */ }
             }
         } }
@@ -57,13 +69,17 @@ class ChapterDownloads private constructor(private val context: Context) {
     fun start(key: String, source: MangaSource, manga: Manga, chapter: Chapter, saveMetadata: (Chapter) -> Unit) {
         if (job?.isActive == true) return
         activeKey = key
-        update(key, DownloadState("İndiriliyor…", active = true))
+        update(key, DownloadState.Downloading(0, chapter.pageCount))
         job = scope.launch { mutex.withLock {
             try {
                 val loaded = if (chapter.pages.isEmpty()) source.readChapter(manga, chapter) else chapter
                 withContext(Dispatchers.Main) { saveMetadata(loaded) }
-                val pages = loaded.pages.map { (it as? Page.Remote)?.url ?: throw IOException("Geçersiz sayfa adresi.") }
+                val remotePages = loaded.pages.map { it as? Page.Remote ?: throw IOException("Geçersiz sayfa adresi.") }
+                remotePages.forEach(ImagePipeline::register)
+                val pages = remotePages.map { it.url }
                 if (pages.isEmpty()) throw IOException("Bölüm boş.")
+                val existing = pages.count { DownloadedImages.existing(context, it) != null }
+                update(key, DownloadState.Downloading(existing, pages.size))
                 manifests.mkdirs()
                 val atomic = manifest(key)
                 val out = atomic.startWrite()
@@ -74,15 +90,21 @@ class ChapterDownloads private constructor(private val context: Context) {
                 for ((index, url) in pages.withIndex()) {
                     ensureActive()
                     if (DownloadedImages.existing(context, url) == null) download(url)
-                    update(key, DownloadState("İndiriliyor · ${index + 1}/${pages.size}", active = true))
+                    update(key, DownloadState.Downloading(index + 1, pages.size))
                 }
-                update(key, DownloadState("İndirildi", complete = true))
+                update(key, DownloadState.Downloaded(pages.size))
             } catch (cancelled: CancellationException) {
-                update(key, DownloadState("Yarım kaldı · Tekrar dene"))
+                val previous = mutableStates.value[key] as? DownloadState.Downloading
+                update(key, DownloadState.Failed(previous?.completed ?: 0, previous?.total ?: 0, "Yarım kaldı"))
                 throw cancelled
             } catch (ex: Exception) {
                 ImageDiagnostics.report(ex, "download=$key")
-                update(key, DownloadState("İndirme başarısız · Tekrar dene"))
+                val previous = mutableStates.value[key] as? DownloadState.Downloading
+                update(key, DownloadState.Failed(
+                    previous?.completed ?: 0,
+                    previous?.total ?: 0,
+                    ex.message ?: "İndirme başarısız"
+                ))
             }
         } }
     }
@@ -144,6 +166,7 @@ class ChapterDownloads private constructor(private val context: Context) {
     }
 
     fun remove(key: String) {
+        update(key, DownloadState.Deleting)
         scope.launch {
             if (activeKey == key) job?.cancelAndJoin()
             mutex.withLock {
@@ -160,7 +183,7 @@ class ChapterDownloads private constructor(private val context: Context) {
                     atomic.delete()
                     mutableStates.value = mutableStates.value - key
                 } catch (ex: Exception) {
-                    update(key, DownloadState("İndirme silinemedi · Tekrar dene"))
+                    update(key, DownloadState.Failed(0, 0, "İndirme silinemedi"))
                 }
             }
         }

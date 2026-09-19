@@ -25,7 +25,9 @@ class WeebCentralSource : MangaSource {
     }
     override suspend fun readChapter(manga: Manga, chapter: Chapter): Chapter {
         require(chapter.remoteId.matches(Regex("[A-Za-z0-9]+")))
+        val referrer = "https://weebcentral.com/chapters/${chapter.remoteId}"
         val pages = parsePages(request("/chapters/${chapter.remoteId}/images?is_prev=False&reading_style=long_strip"))
+            .map { page -> (page as Page.Remote).copy(referrer = referrer) }
         if (pages.isEmpty()) throw IOException("WeebCentral sayfa listesi alınamadı.")
         return chapter.copy(pages = pages, pageCount = pages.size)
     }
@@ -50,7 +52,7 @@ class WeebCentralSource : MangaSource {
             val id = link.absUrl("href").substringAfter("/series/").substringBefore('/')
             val title = image.attr("alt").removeSuffix(" cover").trim()
             if (id.isBlank() || title.isBlank()) null else
-                Manga("weebcentral.$id", title, Page.Remote(image.absUrl("src")), emptyList())
+                Manga("weebcentral.$id", title, Page.Remote(image.absUrl("src"), "weebcentral", "https://weebcentral.com/"), emptyList())
         }.distinctBy { it.id }
     internal fun parseChapters(document: Document): List<Chapter> = document.select("a[href*=/chapters/]")
         .map { link ->
@@ -59,5 +61,5 @@ class WeebCentralSource : MangaSource {
             Chapter(id, title.ifBlank { link.ownText().ifBlank { "Bölüm $id" } }, emptyList())
         }.distinctBy { it.id }.asReversed()
     internal fun parsePages(document: Document): List<Page> = document.select("img[alt^=Page][src]")
-        .map { Page.Remote(it.absUrl("src")) }
+        .map { Page.Remote(it.absUrl("src"), "weebcentral") }
 }

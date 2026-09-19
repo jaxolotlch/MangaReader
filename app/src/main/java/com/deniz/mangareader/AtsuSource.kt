@@ -23,7 +23,7 @@ class AtsuSource : MangaSource {
         return json.getJSONArray("hits").objects().map { hit ->
             val item = hit.getJSONObject("document")
             Manga("atsu.${item.getString("id")}", item.getString("title"),
-                Page.Remote(imageUrl(item.getString("poster"))), emptyList())
+                Page.Remote(imageUrl(item.getString("poster")), "atsu"), emptyList())
         }
     }
 
@@ -51,7 +51,7 @@ class AtsuSource : MangaSource {
             "mangaId" to manga.id.removePrefix("atsu."), "chapterId" to chapter.remoteId
         )).getJSONObject("readChapter")
         val pages = json.getJSONArray("pages").objects().sortedBy { it.getInt("number") }
-            .map { Page.Remote(imageUrl(it.getString("image"))) }
+            .map { Page.Remote(imageUrl(it.getString("image")), "atsu") }
         if (pages.isEmpty()) throw IOException("Bu bölümde okunabilir sayfa bulunamadı.")
         return chapter.copy(pages = pages, pageCount = pages.size)
     }

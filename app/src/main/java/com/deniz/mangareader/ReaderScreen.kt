@@ -34,7 +34,11 @@ import kotlinx.coroutines.withContext
 @Composable
 fun ReaderScreen(
     chapter: Chapter, initialPage: Int, onPageSettled: (Int) -> Unit, onBack: () -> Unit,
-    mangaId: String, chapters: List<Chapter>, onChapterSelected: (Chapter) -> Unit, onCompleted: () -> Unit
+    mangaId: String,
+    chapters: List<Chapter>,
+    onChapterSelected: (Chapter) -> Unit,
+    onCompleted: () -> Unit,
+    onPermanentPageFailure: (Page.Remote, ImageFailure) -> Unit = { _, _ -> }
 ) {
     val pages = chapter.pages
     val pager = rememberPagerState(initialPage = initialPage.coerceIn(pages.indices)) { pages.size }
@@ -70,6 +74,7 @@ fun ReaderScreen(
             withContext(Dispatchers.IO) {
                 for (index in (current + 1)..minOf(current + 3, pages.lastIndex)) {
                     val page = pages[index] as? Page.Remote ?: continue
+                    ImagePipeline.register(page)
                     if (DownloadedImages.existing(context, page.url) != null) continue
                     try {
                         val uri = android.net.Uri.parse(page.url)
@@ -102,7 +107,9 @@ fun ReaderScreen(
             ) { index ->
                 PageImage(pages[index], "Manga sayfası ${index + 1} / ${pages.size}",
                     Modifier.fillMaxSize(), paper = true,
-                    onLoaded = { loadedPages[index] = true }, debugContext = "manga=$mangaId chapter=${chapter.id} page=$index")
+                    onLoaded = { loadedPages[index] = true },
+                    debugContext = "manga=$mangaId chapter=${chapter.id} page=$index",
+                    onPermanentFailure = onPermanentPageFailure)
             }
         }
         if (controlsVisible) {

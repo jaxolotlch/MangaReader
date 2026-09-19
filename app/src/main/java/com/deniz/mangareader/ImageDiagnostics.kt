@@ -7,15 +7,37 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.net.ConnectException
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 
 class NonImageResponse(val mime: String) : IOException("Non-image response: $mime")
 
 // Shared transport for Coil and explicit original-file downloads; no second transient cache.
 object ImagePipeline {
+    private val pageMetadata = ConcurrentHashMap<String, Page.Remote>()
+
+    fun register(page: Page.Remote) {
+        if (page.sourceId != null) pageMetadata[page.url] = page
+    }
+
+    internal fun applySourceHeaders(original: Request): Request {
+        val page = pageMetadata[original.url.toString()]
+        if (page?.sourceId != "weebcentral") return original
+        return original.newBuilder()
+            .header("Referer", page.referrer ?: "https://weebcentral.com/")
+            .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+            .header("User-Agent", "MangaReader/0.3 (Android)")
+            .build()
+    }
+
     val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS)
         .callTimeout(60, TimeUnit.SECONDS)
+        .addInterceptor { chain ->
+            // Normal cross-origin <img> delivery headers; no cookies, tokens, or challenge data.
+            chain.proceed(applySourceHeaders(chain.request()))
+        }
         .addInterceptor { chain ->
             val response = chain.proceed(chain.request())
             val mime = response.body?.contentType()?.toString().orEmpty()
@@ -27,7 +49,12 @@ object ImagePipeline {
         }.build()
 }
 
-data class ImageFailure(val kind: String, val message: String, val mayBeCorrupt: Boolean = false)
+data class ImageFailure(
+    val kind: String,
+    val message: String,
+    val mayBeCorrupt: Boolean = false,
+    val permanent: Boolean = false
+)
 
 object ImageDiagnostics {
     fun classify(error: Throwable): ImageFailure {
@@ -41,7 +68,7 @@ object ImageDiagnostics {
             504 -> "Görsele ulaşılamadı; çevrimdışıysa yerel kopyası bulunmuyor."
             in 500..599 -> "Kaynak sunucusunda hata var (${http.response.code})."
             else -> "Görsel isteği başarısız (${http.response.code})."
-        })
+        }, permanent = http.response.code == 404 || http.response.code == 410)
         if (causes.any { it is NonImageResponse }) return ImageFailure("NON_IMAGE", "Kaynak görsel yerine farklı bir yanıt gönderdi.", true)
         if (causes.any { it is SocketTimeoutException }) return ImageFailure("TIMEOUT", "Görsel yükleme zaman aşımına uğradı.")
         if (causes.any { it is UnknownHostException || it is ConnectException }) return ImageFailure("NETWORK", "Kaynağa bağlanılamadı. Çevrimdışı olabilirsin.")

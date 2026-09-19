@@ -4,7 +4,11 @@ import androidx.annotation.DrawableRes
 
 sealed interface Page {
     data class Local(@param:DrawableRes val imageRes: Int) : Page
-    data class Remote(val url: String) : Page
+    data class Remote(
+        val url: String,
+        val sourceId: String? = null,
+        val referrer: String? = null
+    ) : Page
 }
 data class Chapter(
     val id: String, val title: String, val pages: List<Page>,
@@ -17,6 +21,13 @@ interface MangaSource {
     suspend fun search(query: String): List<Manga> = getManga().filter { it.title.contains(query, true) }
     suspend fun details(manga: Manga): Manga = manga
     suspend fun readChapter(manga: Manga, chapter: Chapter): Chapter = chapter
+}
+
+object SourceCatalog {
+    fun configured(): Map<String, MangaSource> = linkedMapOf(
+        "atsu" to AtsuSource(),
+        "weebcentral" to WeebCentralSource()
+    )
 }
 
 object LocalMangaSource : MangaSource {
