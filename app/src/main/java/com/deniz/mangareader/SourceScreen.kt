@@ -1,6 +1,5 @@
 package com.deniz.mangareader
 
-import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -13,7 +12,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.launch
 
 @Composable
 fun SourceScreen(
@@ -30,7 +28,6 @@ fun SourceScreen(
     val fallback = remember { ChapterFallbackResolver(sources, health) }
     val downloads = remember { ChapterDownloads.get(context) }
     val downloadStates by downloads.states.collectAsState()
-    val scope = rememberCoroutineScope()
 
     var query by rememberSaveable { mutableStateOf("") }
     var submitted by rememberSaveable { mutableStateOf("") }
@@ -45,8 +42,12 @@ fun SourceScreen(
     var reading by remember { mutableStateOf<Chapter?>(null) }
     var loading by remember { mutableStateOf(false) }
     var localMetadata by remember { mutableStateOf(false) }
-    var fallbackRunning by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var failedSources by remember(selectedId, chapterId, retry) {
+        mutableStateOf<Map<String, ImageFailure>>(emptyMap())
+    }
+    var pendingSource by remember(selectedId, chapterId, retry) { mutableStateOf<String?>(null) }
+    var fallbackStatus by remember(selectedId, chapterId, retry) { mutableStateOf<String?>(null) }
 
     fun back() {
         if (chapterId != null) {
@@ -84,22 +85,12 @@ fun SourceScreen(
                 chapterId?.let { idToRead ->
                     val entry = book.chapters.firstOrNull { it.id == idToRead }
                         ?: throw java.io.IOException("Bölüm bulunamadı.")
-                    var loaded = if (entry.pages.isNotEmpty()) entry else source.readChapter(book, entry)
-                    val pageSource = (loaded.pages.firstOrNull() as? Page.Remote)?.sourceId ?: sourceId
-                    if (health.isPermanentlyFailed(SourceFailureKey(pageSource, book.id, entry.id))) {
-                        loaded = when (val result = fallback.resolve(sourceId, book, entry)) {
-                            is FallbackResult.Found -> entry.copy(
-                                pages = result.chapter.pages,
-                                pageCount = result.chapter.pages.size
-                            )
-                            is FallbackResult.Blocked -> throw java.io.IOException(
-                                "Kalıcı kaynak hatası var; güvenli fallback belirsiz: ${result.reason}"
-                            )
-                            FallbackResult.Unavailable -> throw java.io.IOException(
-                                "Kalıcı kaynak hatası var ve güvenli fallback bulunamadı."
-                            )
-                        }
-                    }
+                    val fetched = if (entry.pages.isNotEmpty()) entry else source.readChapter(book, entry)
+                    if (fetched.pages.isEmpty()) throw java.io.IOException("Bu bölümde okunabilir sayfa bulunamadı.")
+                    val loaded = fetched.copy(pages = fetched.pages.map { page ->
+                        if (page is Page.Remote && page.sourceId == null) page.copy(sourceId = sourceId) else page
+                    })
+                    // Health blocks network image loads, never local files or cached pages.
                     store.snapshotChapter(sourceId, book, loaded)
                     reading = loaded
                 }
@@ -119,7 +110,26 @@ fun SourceScreen(
     val book = manga
     val chapter = reading?.takeIf { it.id == chapterId }
     if (book != null && chapter != null) {
-        key(book.id, chapter.id, chapter.pages.firstOrNull()) {
+        // Leaving this reader cancels the search. A late response cannot open another chapter.
+        LaunchedEffect(book.id, chapter.id, pendingSource) {
+            if (pendingSource == null) return@LaunchedEffect
+            fallbackStatus = "Alternatif kaynak aranıyor…"
+            when (val result = fallback.resolve(sourceId, book, chapter, failedSources.keys)) {
+                is FallbackResult.Found -> {
+                    val replacement = chapter.withFallbackPages(result)
+                    store.snapshotChapter(sourceId, book, replacement)
+                    reading = replacement
+                    fallbackStatus = "Sayfalar: ${result.sourceId} · Okuma kaydı asıl kaynakta korunuyor."
+                }
+                is FallbackResult.Blocked -> fallbackStatus = "BLOCKED · ${result.reason}"
+                FallbackResult.Unavailable -> fallbackStatus = "Güvenli alternatif bulunamadı. Yerel sayfalar okunabilir."
+            }
+        }
+        val pageSource = (chapter.pages.firstOrNull() as? Page.Remote)?.sourceId ?: sourceId
+        val sourceFailure = failedSources[pageSource] ?: if (
+            health.isPermanentlyFailed(SourceFailureKey(pageSource, book.id, chapter.id))
+        ) ImageFailure("SOURCE_PERMANENT", "Bu kaynağın bölüm görselleri daha önce 404/410 döndürdü.", permanent = true) else null
+        key(book.id, chapter.id, chapter.pages) {
             ReaderScreen(
                 chapter = chapter,
                 initialPage = store.find(sourceId, book)?.chapters?.get(chapter.id)?.page ?: 0,
@@ -129,25 +139,15 @@ fun SourceScreen(
                 chapters = book.chapters,
                 onChapterSelected = { chapterId = it.id },
                 onCompleted = { store.markCompleted(sourceId, book, chapter) },
-                onPermanentPageFailure = { failedPage, _ ->
-                    if (!fallbackRunning) {
+                sourceFailure = sourceFailure,
+                fallbackStatus = fallbackStatus,
+                onSourcePageFailure = { failedPage, failure ->
+                    if (failure.fallbackEligible) {
                         val failedSource = failedPage.sourceId ?: sourceId
-                        health.markPermanent(SourceFailureKey(failedSource, book.id, chapter.id))
-                        fallbackRunning = true
-                        scope.launch {
-                            when (val result = fallback.resolve(sourceId, book, chapter)) {
-                                is FallbackResult.Found -> {
-                                    val replacement = chapter.copy(
-                                        pages = result.chapter.pages,
-                                        pageCount = result.chapter.pages.size
-                                    )
-                                    store.snapshotChapter(sourceId, book, replacement)
-                                    reading = replacement
-                                }
-                                is FallbackResult.Blocked -> Log.w("MangaFallback", "BLOCKED ${result.reason}")
-                                FallbackResult.Unavailable -> Log.w("MangaFallback", "No safe fallback for ${book.id}/${chapter.id}")
-                            }
-                            fallbackRunning = false
+                        health.recordFailure(SourceFailureKey(failedSource, book.id, chapter.id), failure)
+                        if (failedSource !in failedSources) {
+                            failedSources = failedSources + (failedSource to failure)
+                            pendingSource = failedSource
                         }
                     }
                 }

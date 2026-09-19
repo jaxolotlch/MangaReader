@@ -38,7 +38,9 @@ fun ReaderScreen(
     chapters: List<Chapter>,
     onChapterSelected: (Chapter) -> Unit,
     onCompleted: () -> Unit,
-    onPermanentPageFailure: (Page.Remote, ImageFailure) -> Unit = { _, _ -> }
+    sourceFailure: ImageFailure? = null,
+    fallbackStatus: String? = null,
+    onSourcePageFailure: (Page.Remote, ImageFailure) -> Unit = { _, _ -> }
 ) {
     val pages = chapter.pages
     val pager = rememberPagerState(initialPage = initialPage.coerceIn(pages.indices)) { pages.size }
@@ -50,10 +52,19 @@ fun ReaderScreen(
     val next = if (chapterIndex >= 0) chapters.getOrNull(chapterIndex + 1) else null
     val savePage by rememberUpdatedState(onPageSettled)
     val complete by rememberUpdatedState(onCompleted)
+    // A shorter alternate edition must not silently overwrite a saved, larger page index.
+    var resumePositionAccepted by remember(pager) { mutableStateOf(initialPage in pages.indices) }
     LaunchedEffect(pager) {
-        snapshotFlow { pager.settledPage }.distinctUntilChanged().collect { savePage(it) }
+        val startingPage = pager.settledPage
+        snapshotFlow { pager.settledPage }.distinctUntilChanged().collect {
+            if (it != startingPage) resumePositionAccepted = true
+            if (resumePositionAccepted) savePage(it)
+        }
     }
-    val atEnd = pager.settledPage == pages.lastIndex && loadedPages[pages.lastIndex] == true
+    val atEnd = resumePositionAccepted && pager.settledPage == pages.lastIndex && loadedPages[pages.lastIndex] == true
+    LaunchedEffect(fallbackStatus) {
+        if (fallbackStatus != null) controlsVisible = true
+    }
     LaunchedEffect(atEnd) {
         if (atEnd) {
             savePage(pager.settledPage)
@@ -64,7 +75,8 @@ fun ReaderScreen(
 
     val context = LocalContext.current
     val loader = remember(context) { SingletonImageLoader.get(context) }
-    LaunchedEffect(pager, chapter.id, loader) {
+    LaunchedEffect(pager, chapter.id, loader, sourceFailure) {
+        if (sourceFailure != null) return@LaunchedEffect
         snapshotFlow {
             // Cancel immediately on a new gesture; visible page must finish before speculation resumes.
             if (pager.isScrollInProgress || loadedPages[pager.settledPage] != true) null else pager.settledPage
@@ -109,7 +121,9 @@ fun ReaderScreen(
                     Modifier.fillMaxSize(), paper = true,
                     onLoaded = { loadedPages[index] = true },
                     debugContext = "manga=$mangaId chapter=${chapter.id} page=$index",
-                    onPermanentFailure = onPermanentPageFailure)
+                    sourceFailure = sourceFailure,
+                    failureActive = index == pager.settledPage && !pager.isScrollInProgress,
+                    onSourceFailure = onSourcePageFailure)
             }
         }
         if (controlsVisible) {
@@ -123,6 +137,7 @@ fun ReaderScreen(
             }
             Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()
                 .background(Color(0xDC171717)).padding(horizontal = 12.dp, vertical = 8.dp)) {
+                fallbackStatus?.let { Text(it, color = Color(0xFFE2DDD5), fontSize = 13.sp) }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically) {
                     Text("${pager.settledPage + 1} / ${pages.size}", color = Color(0xFFE2DDD5))

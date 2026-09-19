@@ -37,7 +37,9 @@ fun PageImage(
     paper: Boolean = false,
     onLoaded: () -> Unit = {},
     debugContext: String = contentDescription,
-    onPermanentFailure: (Page.Remote, ImageFailure) -> Unit = { _, _ -> }
+    sourceFailure: ImageFailure? = null,
+    failureActive: Boolean = true,
+    onSourceFailure: (Page.Remote, ImageFailure) -> Unit = { _, _ -> }
 ) {
     when (page) {
         is Page.Local -> {
@@ -46,7 +48,9 @@ fun PageImage(
         }
         is Page.Remote -> {
             val context = LocalContext.current
-            val request = remember(context, page.url) {
+            var forbiddenRetried by remember(page) { mutableStateOf(false) }
+            val notifyFailure by rememberUpdatedState(onSourceFailure)
+            val request = remember(context, page, sourceFailure) {
                 ImagePipeline.register(page)
                 // Unsupported schemes become a normal loading error, never a file/content fetch.
                 val uri = android.net.Uri.parse(page.url)
@@ -56,6 +60,8 @@ fun PageImage(
                     .diskCacheKey(page.url)
                     .diskCachePolicy(CachePolicy.ENABLED)
                     .memoryCachePolicy(CachePolicy.ENABLED)
+                    // Still allow explicit files and Coil's disk/memory cache after a source failure.
+                    .networkCachePolicy(if (sourceFailure == null) CachePolicy.ENABLED else CachePolicy.DISABLED)
                     .build()
             }
             SubcomposeAsyncImage(
@@ -70,10 +76,19 @@ fun PageImage(
                 },
                 error = {
                     val failedPainter = painter
-                    val failure = remember(it.result.throwable) { ImageDiagnostics.classify(it.result.throwable) }
-                    LaunchedEffect(it.result) {
+                    val failure = remember(it.result.throwable, sourceFailure) {
+                        val actual = ImageDiagnostics.classify(it.result.throwable)
+                        if (actual.kind == "HTTP_504" && sourceFailure != null) sourceFailure else actual
+                    }
+                    LaunchedEffect(it.result, failureActive, sourceFailure) {
+                        if (!failureActive) return@LaunchedEffect
                         ImageDiagnostics.report(it.result.throwable, debugContext)
-                        if (failure.permanent) onPermanentFailure(page, failure)
+                        if (failure.kind == "HTTP_403" && sourceFailure == null && !forbiddenRetried && page.sourceId != null) {
+                            // Exactly one ordinary retry; no header guessing or challenge handling.
+                            forbiddenRetried = true
+                            kotlinx.coroutines.delay(300)
+                            failedPainter.restart()
+                        } else if (failure.fallbackEligible) notifyFailure(page, failure)
                     }
                     val scope = rememberCoroutineScope()
                     var retrying by remember { mutableStateOf(false) }
@@ -81,7 +96,7 @@ fun PageImage(
                         verticalArrangement = Arrangement.Center,
                         horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(failure.message, color = Color(0xFFE2DDD5))
-                        TextButton(enabled = !retrying, onClick = {
+                        TextButton(enabled = !retrying && !failure.permanent && sourceFailure == null, onClick = {
                             retrying = true
                             scope.launch {
                                 try {

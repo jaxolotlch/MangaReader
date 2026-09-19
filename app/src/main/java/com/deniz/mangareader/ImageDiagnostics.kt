@@ -19,6 +19,7 @@ object ImagePipeline {
 
     fun register(page: Page.Remote) {
         if (page.sourceId != null) pageMetadata[page.url] = page
+        else pageMetadata.remove(page.url)
     }
 
     internal fun applySourceHeaders(original: Request): Request {
@@ -35,7 +36,7 @@ object ImagePipeline {
         .connectTimeout(15, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS)
         .callTimeout(60, TimeUnit.SECONDS)
         .addInterceptor { chain ->
-            // Normal cross-origin <img> delivery headers; no cookies, tokens, or challenge data.
+            // Source-specific delivery headers; no cookies, tokens, or challenge data.
             chain.proceed(applySourceHeaders(chain.request()))
         }
         .addInterceptor { chain ->
@@ -54,7 +55,9 @@ data class ImageFailure(
     val message: String,
     val mayBeCorrupt: Boolean = false,
     val permanent: Boolean = false
-)
+) {
+    val fallbackEligible: Boolean get() = permanent || kind == "HTTP_403"
+}
 
 object ImageDiagnostics {
     fun classify(error: Throwable): ImageFailure {

@@ -90,5 +90,26 @@ class LibraryPersistenceTest {
         assertNotNull(store.storageError)
         assertEquals("broken", data["library"])
     }
+    @Test fun fallbackSnapshotPreservesPrimaryHistoryAndOtherScanlatorAfterRestart() {
+        val prefs = preferences()
+        val store = LibraryStore(prefs, preferences())
+        store.snapshot("atsu", book)
+        store.record("atsu", book, first, 1)
+        store.markCompleted("atsu", book, first)
+        store.record("atsu", book, second, 0)
+        val before = store.find("atsu", book)!!
+        val alternate = Chapter("different-id", "Different source title",
+            listOf(Page.Remote("https://cdn.test/a.jpg", "weebcentral")), scanlator = "Other group")
+        store.snapshotChapter("atsu", book, first.withFallbackPages(FallbackResult.Found("weebcentral", alternate)))
+        val restored = LibraryStore(prefs, preferences()).find("atsu", book)!!
+        assertEquals(before.chapters, restored.chapters)
+        assertEquals(before.lastReadAt, restored.lastReadAt)
+        assertEquals(before.lastChapterId, restored.lastChapterId)
+        assertEquals("atsu", restored.sourceId)
+        assertEquals(first.id, restored.knownChapters.first().id)
+        assertEquals(first.scanlator, restored.knownChapters.first().scanlator)
+        assertEquals(alternate.pages, restored.knownChapters.first().pages)
+        assertEquals(second, restored.knownChapters.last())
+    }
 }
 

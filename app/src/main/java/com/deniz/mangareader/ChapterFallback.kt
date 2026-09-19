@@ -2,8 +2,10 @@ package com.deniz.mangareader
 
 import android.content.Context
 import android.content.SharedPreferences
-import java.io.IOException
+import java.math.BigDecimal
+import java.text.Normalizer
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 
 data class SourceFailureKey(
     val sourceId: String,
@@ -15,7 +17,7 @@ data class SourceFailureKey(
 
 class SourceHealthMemory private constructor(private val preferences: SharedPreferences?) {
     private val failures = LinkedHashSet<String>().apply {
-        addAll(preferences?.getStringSet(KEY, emptySet()).orEmpty())
+        addAll(preferences?.getStringSet(KEY, emptySet()).orEmpty().toList().takeLast(MAX_ENTRIES))
     }
 
     @Synchronized
@@ -29,14 +31,20 @@ class SourceHealthMemory private constructor(private val preferences: SharedPref
     @Synchronized
     fun isPermanentlyFailed(key: SourceFailureKey): Boolean = key.encoded() in failures
 
+    fun recordFailure(key: SourceFailureKey, failure: ImageFailure) {
+        if (failure.permanent) markPermanent(key)
+    }
+
     companion object {
         private const val KEY = "permanent_source_failures"
         private const val MAX_ENTRIES = 200
 
         fun inMemory() = SourceHealthMemory(null)
-        fun get(context: Context) = SourceHealthMemory(
+        private var instance: SourceHealthMemory? = null
+        @Synchronized
+        fun get(context: Context): SourceHealthMemory = instance ?: SourceHealthMemory(
             context.applicationContext.getSharedPreferences("source_health", Context.MODE_PRIVATE)
-        )
+        ).also { instance = it }
     }
 }
 
@@ -50,9 +58,13 @@ class ChapterFallbackResolver(
     private val sources: Map<String, MangaSource>,
     private val health: SourceHealthMemory
 ) {
-    suspend fun resolve(primarySourceId: String, manga: Manga, chapter: Chapter): FallbackResult {
+    suspend fun resolve(
+        primarySourceId: String, manga: Manga, chapter: Chapter,
+        excludedSources: Set<String> = emptySet()
+    ): FallbackResult {
+        if (normalizeTitle(manga.title).isBlank()) return FallbackResult.Blocked("Manga başlığı doğrulanamıyor.")
         val eligible = sources.filterKeys { sourceId ->
-            sourceId != primarySourceId && !health.isPermanentlyFailed(
+            sourceId != primarySourceId && sourceId !in excludedSources && !health.isPermanentlyFailed(
                 SourceFailureKey(sourceId, manga.id, chapter.id)
             )
         }
@@ -66,30 +78,47 @@ class ChapterFallbackResolver(
                     continue
                 }
                 val alternateManga = source.details(mangaMatches.single())
+                if (normalizeTitle(alternateManga.title) != normalizeTitle(manga.title)) continue
                 val chapterMatches = conservativeChapterMatches(alternateManga.chapters, chapter)
                 if (chapterMatches.size != 1) {
                     if (chapterMatches.size > 1) ambiguousReason = "$sourceId bölüm eşleşmesi belirsiz."
                     continue
                 }
                 val loaded = source.readChapter(alternateManga, chapterMatches.single())
-                if (loaded.pages.isNotEmpty()) return FallbackResult.Found(sourceId, loaded)
-            } catch (_: IOException) {
-                // A source being temporarily unavailable does not poison its health memory.
+                if (loaded.pages.isNotEmpty()) return FallbackResult.Found(sourceId, loaded.copy(
+                    pages = loaded.pages.map { page ->
+                        if (page is Page.Remote) page.copy(sourceId = sourceId) else page
+                    }
+                ))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Metadata/parsing/connection failures are not proof of permanently missing images.
             }
         }
         return ambiguousReason?.let(FallbackResult::Blocked) ?: FallbackResult.Unavailable
     }
 
     internal fun conservativeChapterMatches(candidates: List<Chapter>, primary: Chapter): List<Chapter> {
-        val exact = candidates.filter { normalizeTitle(it.title) == normalizeTitle(primary.title) }
-        if (exact.isNotEmpty()) return exact
-        val number = chapterNumber(primary.title) ?: return emptyList()
-        return candidates.filter { chapterNumber(it.title) == number }
+        val number = chapterNumber(primary.title)
+        if (number != null) {
+            // Check ALL groups before accepting even an exact title match.
+            return candidates.filter { chapterNumber(it.title) == number }
+        }
+        return candidates.filter { normalizeTitle(it.title) == normalizeTitle(primary.title) }
     }
 
-    private fun normalizeTitle(value: String): String = value.lowercase(Locale.ROOT)
-        .replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+    private fun normalizeTitle(value: String): String = Normalizer.normalize(value, Normalizer.Form.NFC)
+        .lowercase(Locale.ROOT).replace(Regex("[^\\p{L}\\p{M}\\p{N}]+"), " ").trim()
 
-    private fun chapterNumber(value: String): String? = Regex("(?<!\\d)(\\d+(?:\\.\\d+)?)(?!\\d)")
-        .find(value)?.groupValues?.get(1)?.trimEnd('0')?.trimEnd('.')
+    internal fun chapterNumber(value: String): String? {
+        // Never mistake a volume number or a number embedded in a title for a chapter.
+        val match = Regex("^(?:(?:chapter|ch\\.?|bölüm)\\s*|#)?(\\d+(?:\\.\\d+)?)(?=\\s|:|$)", RegexOption.IGNORE_CASE)
+            .find(value.trim()) ?: return null
+        return BigDecimal(match.groupValues[1]).stripTrailingZeros().toPlainString()
+    }
 }
+
+// Only replace delivery data. IDs, scanlator and title continue to belong to the primary source.
+internal fun Chapter.withFallbackPages(found: FallbackResult.Found): Chapter =
+    copy(pages = found.chapter.pages, pageCount = found.chapter.pages.size)
